@@ -8,6 +8,7 @@ type HookEvent = "session_start" | "user_prompt_submit" | "subagent_start";
 
 export interface CodexHook {
   id: string;
+  origin: "plugin" | "local";
   plugin: string;
   event: HookEvent;
   command: string;
@@ -18,6 +19,23 @@ export interface CodexHook {
   trusted: boolean;
   supported: boolean;
   enabled: boolean;
+  prompt_adapter_tool?: string;
+}
+
+interface HookOverride {
+  enabled?: boolean;
+  command?: string;
+  timeout_ms?: number;
+  status_message?: string;
+  prompt_adapter_tool?: string;
+  deleted?: boolean;
+}
+
+interface HookState {
+  enabled?: string[];
+  disabled?: string[];
+  overrides?: Record<string, HookOverride>;
+  custom?: Array<Partial<CodexHook>>;
 }
 
 const CODEX_HOME = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
@@ -34,6 +52,37 @@ async function readJson<T>(filePath: string, fallback: T): Promise<T> {
   } catch {
     return fallback;
   }
+}
+
+function normalizedTimeout(value: unknown, fallback = 5000): number {
+  const number = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(number) ? Math.min(Math.max(1000, Math.round(number)), 15000) : fallback;
+}
+
+function text(value: unknown, fallback = "", max = 4000): string {
+  return typeof value === "string" ? value.trim().slice(0, max) : fallback;
+}
+
+function customHook(value: Partial<CodexHook>): CodexHook | undefined {
+  const event = value.event;
+  const command = text(value.command);
+  if (!command || !event) return undefined;
+  const id = /^local:[A-Za-z0-9_-]+$/.test(text(value.id, "", 120)) ? value.id! : `local:${crypto.randomUUID()}`;
+  return {
+    id,
+    origin: "local",
+    plugin: text(value.plugin, "Local Coder", 120) || "Local Coder",
+    event,
+    command,
+    timeout_ms: normalizedTimeout(value.timeout_ms),
+    status_message: text(value.status_message, "", 500) || undefined,
+    source_path: STATE_PATH,
+    plugin_root: "",
+    trusted: true,
+    supported: event === "session_start",
+    enabled: value.enabled === true,
+    prompt_adapter_tool: text(value.prompt_adapter_tool, "", 120) || undefined,
+  };
 }
 
 async function codexConfig(): Promise<{ enabledPlugins: Set<string>; trustedHooks: Set<string> }> {
@@ -73,7 +122,7 @@ async function latestPluginRoot(plugin: string): Promise<string | undefined> {
 
 export async function getCodexHooks(): Promise<CodexHook[]> {
   const { enabledPlugins, trustedHooks } = await codexConfig();
-  const state = await readJson<{ enabled?: string[]; disabled?: string[] }>(STATE_PATH, {});
+  const state = await readJson<HookState>(STATE_PATH, {});
   const forcedEnabled = new Set(state.enabled ?? []);
   const forcedDisabled = new Set(state.disabled ?? []);
   const found: CodexHook[] = [];
@@ -103,6 +152,7 @@ export async function getCodexHooks(): Promise<CodexHook[]> {
             const trusted = trustedHooks.has(id);
             found.push({
               id,
+              origin: "plugin",
               plugin,
               event,
               command: hook.command.replace(/\$\{CLAUDE_PLUGIN_ROOT\}/g, pluginRoot),
@@ -119,17 +169,57 @@ export async function getCodexHooks(): Promise<CodexHook[]> {
       }
     }
   }
-  return found;
+  const configured = found
+    .filter((hook) => !state.overrides?.[hook.id]?.deleted)
+    .map((hook) => {
+      const override = state.overrides?.[hook.id];
+      return {
+        ...hook,
+        command: text(override?.command, hook.command),
+        timeout_ms: normalizedTimeout(override?.timeout_ms, hook.timeout_ms),
+        status_message: text(override?.status_message, hook.status_message ?? "", 500) || undefined,
+        enabled: override?.enabled ?? hook.enabled,
+        prompt_adapter_tool: text(override?.prompt_adapter_tool, "", 120) || undefined,
+      };
+    });
+  return [...configured, ...(state.custom ?? []).flatMap((hook) => {
+    const normalized = customHook(hook);
+    return normalized ? [normalized] : [];
+  })];
 }
 
-export async function saveCodexHooks(enabledIds: unknown): Promise<CodexHook[]> {
-  const hooks = await getCodexHooks();
-  const known = new Set(hooks.map((hook) => hook.id));
-  const enabled = Array.isArray(enabledIds)
-    ? [...new Set(enabledIds.filter((id): id is string => typeof id === "string" && known.has(id)))]
+export async function saveCodexHooks(input: unknown): Promise<CodexHook[]> {
+  const payload = input && typeof input === "object" ? input as { hooks?: unknown; deleted_ids?: unknown } : {};
+  const submitted = Array.isArray(payload.hooks)
+    ? payload.hooks.filter((hook): hook is Partial<CodexHook> => Boolean(hook) && typeof hook === "object")
     : [];
+  const deleted = new Set(Array.isArray(payload.deleted_ids) ? payload.deleted_ids.filter((id): id is string => typeof id === "string") : []);
+  const hooks = await getCodexHooks();
+  const existingPlugins = new Map(hooks.filter((hook) => hook.origin === "plugin").map((hook) => [hook.id, hook]));
+  const overrides: Record<string, HookOverride> = {};
+  const custom: CodexHook[] = [];
+  for (const hook of submitted) {
+    const id = text(hook.id, "", 200);
+    if (deleted.has(id)) continue;
+    const original = existingPlugins.get(id);
+    if (original) {
+      overrides[id] = {
+        enabled: hook.enabled === true,
+        command: text(hook.command, original.command),
+        timeout_ms: normalizedTimeout(hook.timeout_ms, original.timeout_ms),
+        status_message: text(hook.status_message, "", 500) || undefined,
+        prompt_adapter_tool: text(hook.prompt_adapter_tool, "", 120) || undefined,
+      };
+      continue;
+    }
+    const local = customHook(hook);
+    if (local) custom.push(local);
+  }
+  for (const id of deleted) {
+    if (existingPlugins.has(id)) overrides[id] = { deleted: true };
+  }
   await fs.mkdir(path.dirname(STATE_PATH), { recursive: true });
-  await fs.writeFile(STATE_PATH, JSON.stringify({ enabled, disabled: hooks.map((hook) => hook.id).filter((id) => !enabled.includes(id)) }, null, 2) + "\n");
+  await fs.writeFile(STATE_PATH, JSON.stringify({ overrides, custom }, null, 2) + "\n");
   return getCodexHooks();
 }
 
@@ -171,17 +261,12 @@ function hookContext(output: string): string {
 }
 
 export async function runCodexSessionStartHooks(): Promise<string> {
-  const hooks = (await getCodexHooks()).filter((hook) => hook.enabled && hook.supported);
-  const ponytail = hooks.find((hook) => hook.plugin === "ponytail@ponytail" && hook.event === "session_start");
-  const output = await Promise.all(
-    hooks
-      .filter((hook) => hook !== ponytail)
-      .map(async (hook) => hookContext(await execute(hook.command, hook.timeout_ms)))
-  );
-  if (ponytail) {
-    output.push(
-      "Ponytail controller is enabled. Before responding to each new user message, call ponytail_turn with the user's exact prompt. Apply only the active_instructions returned for that turn; when it reports mode off, do not apply any earlier Ponytail instructions."
-    );
+  const allHooks = await getCodexHooks();
+  const hooks = allHooks.filter((hook) => hook.enabled && hook.supported);
+  const output = await Promise.all(hooks.map(async (hook) => hookContext(await execute(hook.command, hook.timeout_ms))));
+  const adapters = allHooks.filter((hook) => hook.enabled && hook.event === "user_prompt_submit" && /^[A-Za-z0-9_.-]+$/.test(hook.prompt_adapter_tool ?? ""));
+  if (adapters.length) {
+    output.push(adapters.map((hook) => `Prompt adapter enabled for ${hook.id}. Before responding to each user message, call ${hook.prompt_adapter_tool} with the exact current user prompt. Apply only the instructions or state returned by that tool.`).join("\n"));
   }
   return output.filter(Boolean).join("\n\n").slice(0, 120_000);
 }

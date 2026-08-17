@@ -161,7 +161,7 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
 
   router.put("/api/codex-hooks", async (req, res) => {
     try {
-      res.json({ ok: true, hooks: await saveCodexHooks(req.body?.enabled) });
+      res.json({ ok: true, hooks: await saveCodexHooks(req.body) });
     } catch (err) {
       res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
     }

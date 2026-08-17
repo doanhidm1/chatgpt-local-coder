@@ -32,7 +32,7 @@ function requestedMode(prompt: string): PonytailMode | undefined {
 }
 
 function ponytailHooks(hooks: CodexHook[]): { activate?: CodexHook; tracker?: CodexHook } {
-  const matching = hooks.filter((hook) => hook.plugin === "ponytail@ponytail" && hook.enabled && hook.trusted);
+  const matching = hooks.filter((hook) => hook.enabled && hook.trusted && /ponytail/i.test(hook.plugin));
   return {
     activate: matching.find((hook) => hook.event === "session_start"),
     tracker: matching.find((hook) => hook.event === "user_prompt_submit"),

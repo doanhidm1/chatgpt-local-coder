@@ -33,6 +33,7 @@ let activityPollTimer = null;
 let activityEventSource = null;
 let activitySeenIds = new Set();
 let activityPaused = false;
+let deletedCodexHookIds = new Set();
 
 function toast(msg, isError = false) {
   const el = document.getElementById("toast");
@@ -151,11 +152,7 @@ function bindServerActions(container, config) {
         } else if (action === "computer-use") {
           await openComputerUseDialog();
         } else if (action === "codex-hooks") {
-          const r = await api("/api/codex-hooks");
-          document.getElementById("codex-hooks-list").innerHTML = r.hooks.length
-            ? r.hooks.map((hook) => `<label class="field checkbox"><input type="checkbox" data-codex-hook="${esc(hook.id)}" ${hook.enabled ? "checked" : ""} ${hook.supported ? "" : "disabled"} /><span><strong>${esc(hook.plugin)}</strong> · ${esc(hook.event)}${hook.supported ? "" : " <small class=\"muted\">MCP không có event này</small>"}<br /><small class="muted">${esc(hook.command)}</small></span></label>`).join("")
-            : '<div class="muted">Không có hook Codex đã cài và bật.</div>';
-          document.getElementById("codex-hooks-dialog").showModal();
+          await openCodexHooksDialog();
         } else if (action === "oauth") {
           const r = await api(`/api/upstream/${id}/oauth/start`, { method: "POST", body: JSON.stringify({ reset: true }) });
           if (!r.status?.authorization_url) throw new Error("OAuth server did not return an authorization URL");
@@ -478,12 +475,45 @@ document.getElementById("save-computer-use").addEventListener("click", async () 
   toast(enabled ? "Computer Use đã bật. Mở chat MCP mới để skill xuất hiện." : "Computer Use đã tắt.");
 });
 
+function codexHookRow(hook) {
+  const local = hook.origin === "local";
+  return `<div class="tool-row" data-codex-hook-row data-codex-hook-id="${esc(hook.id)}" data-codex-hook-origin="${esc(hook.origin || "plugin")}"><div class="form-grid" style="width:100%"><label class="field checkbox"><input type="checkbox" data-codex-enabled ${hook.enabled ? "checked" : ""} /><span>Bật</span></label><label class="field"><span>Nguồn</span><input data-codex-plugin value="${esc(hook.plugin)}" ${local ? "" : "readonly"} /></label><label class="field"><span>Event</span><select data-codex-event ${local ? "" : "disabled"}><option value="session_start" ${hook.event === "session_start" ? "selected" : ""}>session_start</option><option value="user_prompt_submit" ${hook.event === "user_prompt_submit" ? "selected" : ""}>user_prompt_submit</option><option value="subagent_start" ${hook.event === "subagent_start" ? "selected" : ""}>subagent_start</option></select></label><label class="field"><span>Timeout ms</span><input data-codex-timeout type="number" min="1000" max="15000" value="${Number(hook.timeout_ms) || 5000}" /></label><label class="field span-2"><span>Command</span><input data-codex-command value="${esc(hook.command)}" /></label><label class="field"><span>Status</span><input data-codex-status value="${esc(hook.status_message || "")}" /></label><div class="field"><span>&nbsp;</span><button type="button" class="btn ghost sm" data-codex-hook-delete>Xóa</button></div></div><div class="muted" style="font-size:0.72rem">${esc(hook.id)} · ${hook.supported ? "SessionStart chạy ở chat mới" : "MCP chưa có event này"}</div></div>`;
+}
+
+function addCodexHookRow() {
+  const list = document.getElementById("codex-hooks-list");
+  list.insertAdjacentHTML("beforeend", codexHookRow({ id: `local:${crypto.randomUUID()}`, origin: "local", plugin: "Local Coder", event: "session_start", command: "", timeout_ms: 5000, enabled: true }));
+  addPromptAdapterField([...list.querySelectorAll("[data-codex-hook-row]")].at(-1));
+}
+
+function addPromptAdapterField(row, value = "") {
+  row.querySelector(".form-grid").insertAdjacentHTML("beforeend", `<label class="field"><span>Prompt adapter tool</span><input data-codex-adapter value="${esc(value)}" placeholder="ponytail_turn" /></label>`);
+}
+
+async function openCodexHooksDialog() {
+  const r = await api("/api/codex-hooks");
+  deletedCodexHookIds = new Set();
+  const list = document.getElementById("codex-hooks-list");
+  list.innerHTML = r.hooks.length ? r.hooks.map(codexHookRow).join("") : '<div class="muted">Chưa có hook. Thêm hook Local Coder hoặc bật plugin trong Codex.</div>';
+  r.hooks.forEach((hook, index) => addPromptAdapterField(list.querySelectorAll("[data-codex-hook-row]")[index], hook.prompt_adapter_tool || ""));
+  document.getElementById("codex-hooks-dialog").showModal();
+}
+
+document.getElementById("codex-hooks-list").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-codex-hook-delete]");
+  if (!button) return;
+  const row = button.closest("[data-codex-hook-row]");
+  deletedCodexHookIds.add(row.dataset.codexHookId);
+  row.remove();
+});
+document.getElementById("add-codex-hook").addEventListener("click", addCodexHookRow);
 document.getElementById("close-codex-hooks").addEventListener("click", () => document.getElementById("codex-hooks-dialog").close());
 document.getElementById("save-codex-hooks").addEventListener("click", async () => {
-  const enabled = [...document.querySelectorAll("[data-codex-hook]:checked")].map((input) => input.dataset.codexHook);
-  await api("/api/codex-hooks", { method: "PUT", body: JSON.stringify({ enabled }) });
+  const hooks = [...document.querySelectorAll("[data-codex-hook-row]")].map((row) => ({ id: row.dataset.codexHookId, origin: row.dataset.codexHookOrigin, plugin: row.querySelector("[data-codex-plugin]").value, event: row.querySelector("[data-codex-event]").value, command: row.querySelector("[data-codex-command]").value, timeout_ms: Number(row.querySelector("[data-codex-timeout]").value), status_message: row.querySelector("[data-codex-status]").value, enabled: row.querySelector("[data-codex-enabled]").checked }));
+  hooks.forEach((hook, index) => (hook.prompt_adapter_tool = document.querySelectorAll("[data-codex-adapter]")[index]?.value || ""));
+  await api("/api/codex-hooks", { method: "PUT", body: JSON.stringify({ hooks, deleted_ids: [...deletedCodexHookIds] }) });
   document.getElementById("codex-hooks-dialog").close();
-  toast("Đã lưu. Hook SessionStart áp dụng ở chat MCP mới.");
+  toast("Đã lưu. SessionStart áp dụng ở chat MCP mới.");
 });
 
 document.querySelectorAll(".nav-item").forEach((btn) => {

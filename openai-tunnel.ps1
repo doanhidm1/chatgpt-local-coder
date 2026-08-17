@@ -115,13 +115,15 @@ function Stop-ExistingTunnel([int]$TargetHealthPort) {
     Start-Sleep -Seconds 1
 }
 
-function Ensure-Profile([string]$McpUrl, [string]$TunnelId, [int]$TargetHealthPort) {
+function Ensure-Profile([string]$McpUrl, [string]$TunnelId, [int]$TargetHealthPort, [string]$OrganizationId) {
     New-Item -ItemType Directory -Force -Path $ProfileDir | Out-Null
+    $organizationLine = if ($OrganizationId) { "  organization_id: $OrganizationId" } else { "" }
     $yaml = @"
 config_version: 1
 control_plane:
   tunnel_id: $TunnelId
   api_key: env:OPENAI_TUNNEL_API_KEY
+$organizationLine
 log:
   level: info
   format: struct-text
@@ -202,12 +204,14 @@ function Invoke-TunnelInit {
     $envHealth = Get-DotEnvValue "OPENAI_TUNNEL_HEALTH_PORT"
     $resolvedHealth = if ($HealthPort -gt 0) { $HealthPort } elseif ($envHealth) { [int]$envHealth } else { 8080 }
     $mcpUrl = "http://127.0.0.1:$resolvedPort/mcp"
-    Ensure-Profile -McpUrl $mcpUrl -TunnelId $tunnelId -TargetHealthPort $resolvedHealth
+    $organizationId = Get-DotEnvValue "OPENAI_TUNNEL_ORGANIZATION_ID"
+    Ensure-Profile -McpUrl $mcpUrl -TunnelId $tunnelId -TargetHealthPort $resolvedHealth -OrganizationId $organizationId
 
     $bin = Install-TunnelClient
     $env:OPENAI_TUNNEL_API_KEY = $apiKey
     $env:CONTROL_PLANE_API_KEY = $apiKey
     $env:CONTROL_PLANE_TUNNEL_ID = $tunnelId
+    $env:CONTROL_PLANE_ORGANIZATION_ID = $organizationId
 
     Write-Host ""
     Write-Host "Chay doctor..." -ForegroundColor Yellow
@@ -242,6 +246,7 @@ $envHealth = Get-DotEnvValue "OPENAI_TUNNEL_HEALTH_PORT"
 $resolvedHealth = if ($HealthPort -gt 0) { $HealthPort } elseif ($envHealth) { [int]$envHealth } else { 8080 }
 $tunnelId = Get-DotEnvValue "OPENAI_TUNNEL_ID"
 $apiKey = Get-DotEnvValue "OPENAI_TUNNEL_API_KEY"
+$organizationId = Get-DotEnvValue "OPENAI_TUNNEL_ORGANIZATION_ID"
 
 if (-not $tunnelId -or -not $apiKey) {
     Write-Host ""
@@ -260,11 +265,12 @@ if (-not $bin) {
 }
 
 $mcpUrl = "http://127.0.0.1:$resolvedPort/mcp"
-Ensure-Profile -McpUrl $mcpUrl -TunnelId $tunnelId -TargetHealthPort $resolvedHealth
+Ensure-Profile -McpUrl $mcpUrl -TunnelId $tunnelId -TargetHealthPort $resolvedHealth -OrganizationId $organizationId
 
 $env:OPENAI_TUNNEL_API_KEY = $apiKey
 $env:CONTROL_PLANE_API_KEY = $apiKey
 $env:CONTROL_PLANE_TUNNEL_ID = $tunnelId
+$env:CONTROL_PLANE_ORGANIZATION_ID = $organizationId
 
 $existingPid = Get-PortOwnerPid -TargetPort $resolvedHealth
 if ($existingPid -and (Test-TunnelHealthy $resolvedHealth)) {
